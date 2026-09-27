@@ -1,0 +1,10 @@
+[package]
+name = "dual-protocol"
+version = "0.1.0"
+description = "Wire-compatible protocol types for the Dual game"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
