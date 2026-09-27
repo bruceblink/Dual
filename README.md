@@ -2,7 +2,7 @@
 
 一款用 Java + [Processing 4](https://processing.org/) 编写的**本地 / 联机**双人（或人机）弓箭对战小游戏。游戏采用 1280×720 的 16:9 确定性竞技场，默认完整等比输出到 1920×1080；两名角色用短弓快速骚扰、用长弓蓄力致命一击，先击杀对手者获胜。支持通过 Relay 服务器进行互联网联机对战。
 
-> `Dual` 会继续使用 Java + Processing 开发，当前 Java 客户端与 Java Relay 都属于本游戏。Godot 项目 `dual-game-client` 是玩法和产品定位均独立的另一款游戏，不是 `Dual` 的正式版、迁移版或替代工程。玩法方向见 [游戏设计](docs/GAME_DESIGN.md)，操作与规则落地见 [玩法开发指导](docs/GAMEPLAY_IMPLEMENTATION_GUIDE.md)，实施顺序见 [设计开发计划](docs/DEVELOPMENT_PLAN.md)，项目边界见 [技术路线说明](docs/TECHNOLOGY_EVALUATION.md)。
+> `Dual` 当前保留 Java + Processing 基线，并在 `feature/macroquad-migration` 分支并行开发 Rust + Macroquad 客户端和 Rust Relay。Godot 项目 `dual-game-client` 是玩法和产品定位均独立的另一款游戏，不是 `Dual` 的正式版、迁移版或替代工程。玩法方向见 [游戏设计](docs/GAME_DESIGN.md)，操作与规则落地见 [玩法开发指导](docs/GAMEPLAY_IMPLEMENTATION_GUIDE.md)，Java 实施顺序见 [设计开发计划](docs/DEVELOPMENT_PLAN.md)，Macroquad 迁移细节见 [迁移计划](docs/01-macroquad-migration-plan.md)，项目边界见 [技术路线说明](docs/TECHNOLOGY_EVALUATION.md)。
 
 ## 游戏界面
 

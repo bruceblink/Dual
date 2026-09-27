@@ -6,6 +6,8 @@
 
 产品规则与取舍以 [游戏设计](GAME_DESIGN.md) 为准，具体实现边界以 [玩法落地开发指导](GAMEPLAY_IMPLEMENTATION_GUIDE.md) 为准，工程边界以 [技术路线说明](TECHNOLOGY_EVALUATION.md) 为准。
 
+当前仓库的 Rust + Macroquad 并行迁移不改变 Java 基线里程碑。迁移阶段、接口边界、提交顺序和 Windows 无 JVM 验收条件见 [Macroquad 迁移计划](01-macroquad-migration-plan.md)。
+
 ## 2. 当前基线
 
 ### 已有能力
