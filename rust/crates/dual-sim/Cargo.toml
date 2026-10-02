@@ -1,0 +1,13 @@
+[package]
+name = "dual-sim"
+version = "0.1.0"
+description = "Deterministic, renderer-independent rules for the Dual game"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dual-protocol = { path = "../dual-protocol" }
+
+[lints]
+workspace = true

@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "dual-protocol"
 version = "0.1.0"
+
+[[package]]
+name = "dual-sim"
+version = "0.1.0"
+dependencies = [
+ "dual-protocol",
+]
