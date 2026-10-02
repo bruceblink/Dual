@@ -8,6 +8,10 @@
 
 use dual_protocol::{RoundResult, WinnerSide};
 
+mod ai;
+
+pub use ai::{AiController, AiDifficulty, AiPlan};
+
 pub const FPS: u32 = 60;
 pub const ARENA_WIDTH: f32 = 1_280.0;
 pub const ARENA_HEIGHT: f32 = 720.0;
