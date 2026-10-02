@@ -24,7 +24,8 @@ pub const PLAYER_BOUNCE: f32 = 0.5;
 pub const PLAYER_THRUST_SPEED: f32 = 8.0;
 pub const DAMAGED_FRAMES: u16 = 45;
 pub const DAMAGED_END_FEEDBACK_FRAMES: u16 = 8;
-pub const SHORTBOW_ARROW_RADIUS: f32 = 20.0;
+pub const SHORTBOW_MAX_CONSECUTIVE_PRESSURES: u8 = 2;
+pub const SHORTBOW_ARROW_RADIUS: f32 = 8.0;
 pub const SHORTBOW_ARROW_START_SPEED: f32 = 24.0;
 pub const SHORTBOW_ARROW_TERMINAL_SPEED: f32 = 8.0;
 pub const SHORTBOW_MAX_AMMO: u8 = 3;
@@ -38,6 +39,7 @@ pub const LONGBOW_COMPONENT_RADIUS: f32 = 16.0;
 pub const LONGBOW_CHARGE_FRAMES: u16 = 30;
 pub const LONGBOW_RECOVERY_FRAMES: u16 = 21;
 pub const LONGBOW_CHARGE_MOVE_RATIO: f32 = 0.5;
+pub const LONGBOW_AIM_SPEED_RATIO: f32 = 0.1;
 pub const LONGBOW_AUTO_AIM_RANGE: f32 = 520.0;
 pub const MATCH_ROUNDS_TO_WIN: u8 = 3;
 
@@ -289,6 +291,7 @@ impl ArenaRect {
         )
     }
 
+    /// Tests one expanded rectangle face and rejects contacts beyond its edge.
     fn face_impact(
         self,
         start: Vec2,
@@ -347,6 +350,7 @@ impl ArenaRect {
         })
     }
 
+    /// Solves a swept circle against one corner and keeps only its outside quadrant.
     fn corner_impact(
         self,
         start: Vec2,
@@ -390,6 +394,7 @@ impl ArenaRect {
         })
     }
 
+    /// Projects a circle that starts inside cover onto its nearest credible face.
     fn project_blocked_point(self, center: Vec2, movement: Vec2) -> CoverImpact {
         let closest = Vec2::new(
             center.x.clamp(self.left(), self.right()),
@@ -472,6 +477,7 @@ impl ArenaRect {
     }
 }
 
+/// Keeps the earliest contact so projectile feedback matches collision ordering.
 fn earlier(current: Option<CoverImpact>, candidate: Option<CoverImpact>) -> Option<CoverImpact> {
     match (current, candidate) {
         (None, next) => next,
@@ -502,14 +508,14 @@ pub enum Side {
 }
 
 impl Side {
-    const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         match self {
             Self::One => 0,
             Self::Two => 1,
         }
     }
 
-    const fn opponent(self) -> Self {
+    pub const fn opponent(self) -> Self {
         match self {
             Self::One => Self::Two,
             Self::Two => Self::One,
@@ -534,6 +540,8 @@ pub struct PlayerInput {
     pub shortbow: bool,
     pub longbow: bool,
     pub aim_angle: Option<f32>,
+    /// Allows an AI shortbow action to use its intercept decision instead of auto-aim.
+    pub intercept_aim: bool,
 }
 
 impl PlayerInput {
@@ -546,6 +554,7 @@ impl PlayerInput {
             shortbow: false,
             longbow: false,
             aim_angle: None,
+            intercept_aim: false,
         }
     }
 
@@ -558,6 +567,7 @@ impl PlayerInput {
             shortbow: input.shortbow(),
             longbow: input.longbow(),
             aim_angle: input.aim_angle(),
+            intercept_aim: false,
         }
     }
 }
@@ -588,6 +598,7 @@ pub struct PlayerState {
     pub longbow_recovery_frames: u16,
     pub damage_remaining_frames: u16,
     pub pressure_count: u8,
+    pub damage_end_feedback_frames: u16,
 }
 
 impl PlayerState {
@@ -606,6 +617,7 @@ impl PlayerState {
             longbow_recovery_frames: 0,
             damage_remaining_frames: 0,
             pressure_count: 0,
+            damage_end_feedback_frames: 0,
         }
     }
 }
@@ -743,6 +755,7 @@ pub struct PlayerSnapshot {
     pub longbow_recovery_frames: u16,
     pub damage_remaining_frames: u16,
     pub pressure_count: u8,
+    pub damage_end_feedback_frames: u16,
 }
 
 impl From<PlayerState> for PlayerSnapshot {
@@ -760,6 +773,7 @@ impl From<PlayerState> for PlayerSnapshot {
             longbow_recovery_frames: player.longbow_recovery_frames,
             damage_remaining_frames: player.damage_remaining_frames,
             pressure_count: player.pressure_count,
+            damage_end_feedback_frames: player.damage_end_feedback_frames,
         }
     }
 }
@@ -810,7 +824,7 @@ pub struct Simulation {
     score: MatchScore,
     last_round_result: Option<RoundResult>,
     previous_shortbow: [bool; 2],
-    buffered_shortbow: [bool; 2],
+    buffered_shortbow_frames: [u16; 2],
     events: Vec<SimEvent>,
 }
 
@@ -829,7 +843,7 @@ impl Simulation {
             arrows: Vec::new(),
             last_round_result: None,
             previous_shortbow: [false; 2],
-            buffered_shortbow: [false; 2],
+            buffered_shortbow_frames: [0; 2],
             events: Vec::new(),
         }
     }
@@ -906,7 +920,7 @@ impl Simulation {
         self.arrows.clear();
         self.last_round_result = None;
         self.previous_shortbow = [false; 2];
-        self.buffered_shortbow = [false; 2];
+        self.buffered_shortbow_frames = [0; 2];
         self.events.clear();
     }
 
@@ -915,6 +929,7 @@ impl Simulation {
         self.reset_round();
     }
 
+    /// Advances active projectiles once and marks those that leave the arena.
     fn update_arrows(&mut self) {
         for arrow in &mut self.arrows {
             if !arrow.removed {
@@ -923,15 +938,25 @@ impl Simulation {
         }
     }
 
+    /// Updates shared physics first, then applies each side's intent and timers.
     fn update_players(&mut self, inputs: [PlayerInput; 2]) {
+        for index in 0..2 {
+            if self.players[index].phase == PlayerPhase::Dead {
+                continue;
+            }
+            self.update_player_physics(index);
+            self.tick_player_timers(index);
+            self.buffered_shortbow_frames[index] =
+                self.buffered_shortbow_frames[index].saturating_sub(1);
+        }
+
         for (index, input) in inputs.into_iter().enumerate() {
             if self.players[index].phase == PlayerPhase::Dead {
                 continue;
             }
-            self.tick_player_timers(index);
             let shortbow_edge = input.shortbow && !self.previous_shortbow[index];
             if shortbow_edge && self.players[index].phase != PlayerPhase::LongbowCharge {
-                self.buffered_shortbow[index] = true;
+                self.buffered_shortbow_frames[index] = 6;
             }
 
             let phase_before_update = self.players[index].phase;
@@ -942,10 +967,21 @@ impl Simulation {
                 PlayerPhase::Damaged => self.update_damaged_player(index),
                 PlayerPhase::Dead => {}
             }
-            self.clamp_player_to_arena(index);
         }
     }
 
+    /// Moves by prior-frame velocity, then applies arena constraints and friction
+    /// in the same order as the Java actor update.
+    fn update_player_physics(&mut self, index: usize) {
+        self.players[index].position = self.players[index]
+            .position
+            .plus(self.players[index].velocity);
+        self.clamp_player_to_arena(index);
+        self.players[index].velocity.x *= PLAYER_FRICTION;
+        self.players[index].velocity.y *= PLAYER_FRICTION;
+    }
+
+    /// Advances bounded weapon and feedback timers for one living player.
     fn tick_player_timers(&mut self, index: usize) {
         let player = &mut self.players[index];
         if player.shortbow_ammo < SHORTBOW_MAX_AMMO {
@@ -960,18 +996,20 @@ impl Simulation {
         player.shortbow_cooldown_frames = player.shortbow_cooldown_frames.saturating_sub(1);
         player.shortbow_action_frames = player.shortbow_action_frames.saturating_sub(1);
         player.longbow_recovery_frames = player.longbow_recovery_frames.saturating_sub(1);
+        player.damage_end_feedback_frames = player.damage_end_feedback_frames.saturating_sub(1);
     }
 
+    /// Applies movement, buffered shortbow fire, and longbow entry in priority order.
     fn update_moving_player(&mut self, index: usize, input: PlayerInput) {
         self.apply_movement(index, input, 1.0);
         if self.players[index].longbow_recovery_frames > 0 {
             return;
         }
-        if self.buffered_shortbow[index]
+        if self.buffered_shortbow_frames[index] > 0
             && self.players[index].shortbow_cooldown_frames == 0
             && self.players[index].shortbow_ammo > 0
         {
-            self.buffered_shortbow[index] = false;
+            self.buffered_shortbow_frames[index] = 0;
             self.update_aim(index, input, false);
             self.fire_shortbow(index);
             self.players[index].phase = PlayerPhase::ShortbowAction;
@@ -979,13 +1017,14 @@ impl Simulation {
             return;
         }
         if input.longbow {
-            self.buffered_shortbow[index] = false;
+            self.buffered_shortbow_frames[index] = 0;
             self.update_aim(index, input, true);
             self.players[index].phase = PlayerPhase::LongbowCharge;
             self.players[index].longbow_charge_frames = 1;
         }
     }
 
+    /// Keeps the fixed shortbow follow-through active while movement continues.
     fn update_shortbow_action(&mut self, index: usize, input: PlayerInput) {
         self.update_aim(index, input, false);
         self.apply_movement(index, input, 1.0);
@@ -994,6 +1033,7 @@ impl Simulation {
         }
     }
 
+    /// Advances or cancels charge, releasing only after the full charge threshold.
     fn update_longbow_charge(&mut self, index: usize, input: PlayerInput) {
         self.update_aim(index, input, true);
         self.apply_movement(index, input, LONGBOW_CHARGE_MOVE_RATIO);
@@ -1011,18 +1051,18 @@ impl Simulation {
         }
     }
 
+    /// Counts down vulnerability and clears its refresh limit when the window ends.
     fn update_damaged_player(&mut self, index: usize) {
         let player = &mut self.players[index];
-        player.position = player.position.plus(player.velocity);
-        player.velocity.x *= PLAYER_FRICTION;
-        player.velocity.y *= PLAYER_FRICTION;
         player.damage_remaining_frames = player.damage_remaining_frames.saturating_sub(1);
         if player.damage_remaining_frames == 0 {
             player.pressure_count = 0;
+            player.damage_end_feedback_frames = DAMAGED_END_FEEDBACK_FRAMES;
             player.phase = PlayerPhase::Move;
         }
     }
 
+    /// Converts directional intent into capped acceleration without moving this frame.
     fn apply_movement(&mut self, index: usize, input: PlayerInput, move_ratio: f32) {
         let mut acceleration = Vec2::new(
             f32::from(input.right) - f32::from(input.left),
@@ -1036,11 +1076,9 @@ impl Simulation {
             (player.velocity.x + acceleration.x * move_ratio).clamp(-PLAYER_MAX_VX, PLAYER_MAX_VX);
         player.velocity.y =
             (player.velocity.y + acceleration.y * move_ratio).clamp(-PLAYER_MAX_VY, PLAYER_MAX_VY);
-        player.position = player.position.plus(player.velocity);
-        player.velocity.x *= PLAYER_FRICTION;
-        player.velocity.y *= PLAYER_FRICTION;
     }
 
+    /// Resolves arena bounds and cover overlaps after the previous velocity moves.
     fn clamp_player_to_arena(&mut self, index: usize) {
         let player = &mut self.players[index];
         if player.position.x < PLAYER_RADIUS {
@@ -1064,32 +1102,41 @@ impl Simulation {
             .resolve_player(&mut player.position, &mut player.velocity);
     }
 
+    /// Uses target lock before manual aim for longbow and always auto-aims the shortbow.
     fn update_aim(&mut self, index: usize, input: PlayerInput, use_longbow_lock: bool) {
-        if let Some(angle) = input.aim_angle {
-            self.players[index].aim_angle = angle;
-            return;
-        }
-
         let target = self.players[index].side.opponent().index();
         let delta = self.players[target]
             .position
             .minus(self.players[index].position);
         let target_distance_squared = delta.length_squared();
-        if (!use_longbow_lock || target_distance_squared <= LONGBOW_AUTO_AIM_RANGE.powi(2))
-            && self.config.arena.has_clear_projectile_path(
-                self.players[index].position,
-                self.players[target].position,
-                if use_longbow_lock {
-                    LONGBOW_COMPONENT_RADIUS
-                } else {
-                    SHORTBOW_ARROW_RADIUS
-                },
-            )
-        {
+        let target_in_longbow_range = target_distance_squared <= LONGBOW_AUTO_AIM_RANGE.powi(2);
+        let target_path_is_clear = self.config.arena.has_clear_projectile_path(
+            self.players[index].position,
+            self.players[target].position,
+            if use_longbow_lock {
+                LONGBOW_COMPONENT_RADIUS
+            } else {
+                SHORTBOW_ARROW_RADIUS
+            },
+        );
+        if !use_longbow_lock && input.intercept_aim {
+            if let Some(angle) = input.aim_angle {
+                self.players[index].aim_angle = angle;
+                return;
+            }
+        }
+        if !use_longbow_lock || (target_in_longbow_range && target_path_is_clear) {
             self.players[index].aim_angle = delta.y.atan2(delta.x);
+        } else if let Some(angle) = input.aim_angle {
+            self.players[index].aim_angle = angle;
+        } else {
+            let horizontal = f32::from(input.right) - f32::from(input.left);
+            self.players[index].aim_angle +=
+                horizontal * LONGBOW_AIM_SPEED_RATIO * std::f32::consts::TAU / FPS as f32;
         }
     }
 
+    /// Consumes one reserve arrow and creates a nonlethal projectile at its launch offset.
     fn fire_shortbow(&mut self, index: usize) {
         let player = self.players[index];
         if player.shortbow_ammo == 0 || player.shortbow_cooldown_frames > 0 {
@@ -1113,6 +1160,7 @@ impl Simulation {
         });
     }
 
+    /// Creates the ordered shaft/head volley and starts the post-shot recovery timer.
     fn fire_longbow(&mut self, index: usize) {
         let player = self.players[index];
         let direction = Vec2::from_angle(player.aim_angle);
@@ -1147,6 +1195,7 @@ impl Simulation {
         });
     }
 
+    /// Removes every projectile whose swept path reaches solid cover this frame.
     fn resolve_cover_impacts(&mut self) {
         for arrow in &mut self.arrows {
             if arrow.removed {
@@ -1166,6 +1215,7 @@ impl Simulation {
         }
     }
 
+    /// Resolves only the earliest opposing-arrow contact in the current frame.
     fn resolve_arrow_interception(&mut self) {
         let mut earliest: Option<(usize, usize, f32, Vec2)> = None;
         for first_index in 0..self.arrows.len() {
@@ -1193,46 +1243,64 @@ impl Simulation {
         }
     }
 
+    /// Processes player one then player two, allowing both sides to hit in one frame.
     fn resolve_player_hits(&mut self) {
-        let mut hit: Option<(usize, Side, Side)> = None;
-        for (arrow_index, arrow) in self.arrows.iter().enumerate() {
-            if arrow.removed {
-                continue;
-            }
-            let target_side = arrow.owner.opponent();
-            let target = self.players[target_side.index()];
-            if target.phase == PlayerPhase::Dead {
-                continue;
-            }
-            let distance = arrow.position.minus(target.position).length_squared();
-            let collision_distance = arrow.kind.radius() + PLAYER_RADIUS;
-            if distance < collision_distance * collision_distance {
-                hit = Some((arrow_index, arrow.owner, target_side));
-                break;
+        for attacker in [Side::One, Side::Two] {
+            let target = attacker.opponent();
+            for arrow_index in 0..self.arrows.len() {
+                let arrow = self.arrows[arrow_index];
+                if arrow.removed || arrow.owner != attacker {
+                    continue;
+                }
+                let target_player = self.players[target.index()];
+                if target_player.phase == PlayerPhase::Dead {
+                    break;
+                }
+                let distance = arrow
+                    .position
+                    .minus(target_player.position)
+                    .length_squared();
+                let collision_distance = arrow.kind.radius() + PLAYER_RADIUS;
+                if distance >= collision_distance * collision_distance {
+                    continue;
+                }
+
+                self.arrows[arrow_index].removed = true;
+                if arrow.kind.is_lethal() {
+                    self.players[target.index()].phase = PlayerPhase::Dead;
+                    self.events.push(SimEvent::LongbowHit { attacker, target });
+                    break;
+                }
+
+                let thrust = arrow
+                    .velocity
+                    .normalized_or(Vec2::from_angle(arrow.rotation_angle))
+                    .scale(PLAYER_THRUST_SPEED);
+                let target_player = &mut self.players[target.index()];
+                target_player.velocity = thrust;
+                if target_player.pressure_count < SHORTBOW_MAX_CONSECUTIVE_PRESSURES {
+                    target_player.pressure_count += 1;
+                    target_player.phase = PlayerPhase::Damaged;
+                    target_player.damage_remaining_frames = DAMAGED_FRAMES;
+                    target_player.damage_end_feedback_frames = 0;
+                }
+                self.events.push(SimEvent::ShortbowHit { attacker, target });
             }
         }
-        let Some((arrow_index, attacker, target)) = hit else {
-            return;
-        };
-        self.arrows[arrow_index].removed = true;
-        if self.arrows[arrow_index].kind.is_lethal() {
-            self.players[target.index()].phase = PlayerPhase::Dead;
-            self.events.push(SimEvent::LongbowHit { attacker, target });
-            self.finish_round(attacker);
-        } else {
-            let thrust = self.arrows[arrow_index]
-                .velocity
-                .normalized_or(Vec2::from_angle(self.arrows[arrow_index].rotation_angle))
-                .scale(PLAYER_THRUST_SPEED);
-            let target_player = &mut self.players[target.index()];
-            target_player.velocity = thrust;
-            target_player.phase = PlayerPhase::Damaged;
-            target_player.damage_remaining_frames = DAMAGED_FRAMES;
-            target_player.pressure_count = target_player.pressure_count.saturating_add(1).min(2);
-            self.events.push(SimEvent::ShortbowHit { attacker, target });
+
+        if self.players[Side::One.index()].phase == PlayerPhase::Dead
+            || self.players[Side::Two.index()].phase == PlayerPhase::Dead
+        {
+            let winner = if self.players[Side::One.index()].phase == PlayerPhase::Dead {
+                Side::Two
+            } else {
+                Side::One
+            };
+            self.finish_round(winner);
         }
     }
 
+    /// Scores one completed round and freezes its immutable wire-compatible result.
     fn finish_round(&mut self, winner: Side) {
         match winner {
             Side::One => self.score.player_one_wins += 1,
@@ -1252,6 +1320,7 @@ impl Simulation {
     }
 }
 
+/// Returns first-contact time and midpoint for two projectile paths during one tick.
 fn swept_circle_collision(first: ArrowState, second: ArrowState) -> Option<(f32, Vec2)> {
     let first_step = first.position.minus(first.previous_position);
     let second_step = second.position.minus(second.previous_position);
@@ -1322,6 +1391,11 @@ mod tests {
             ..PlayerInput::empty()
         };
         simulation.step([input, PlayerInput::empty()]);
+        let first_frame = simulation.players()[0];
+        assert_eq!(first_frame.position, Vec2::new(640.0, 620.0));
+        assert!(first_frame.velocity.x > 0.0);
+        assert!(first_frame.velocity.y < 0.0);
+        simulation.step([input, PlayerInput::empty()]);
         let player = simulation.players()[0];
         assert!(player.position.x > 640.0);
         assert!(player.position.y < 620.0);
@@ -1355,6 +1429,163 @@ mod tests {
         assert!(target.velocity.y < 0.0);
         simulation.step([PlayerInput::empty(), PlayerInput::empty()]);
         assert!(simulation.players()[1].position.y < 580.0);
+    }
+
+    #[test]
+    fn third_shortbow_hit_keeps_knockback_without_refreshing_pressure() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 15);
+        let target = &mut simulation.players[1];
+        target.phase = PlayerPhase::Damaged;
+        target.damage_remaining_frames = 10;
+        target.pressure_count = SHORTBOW_MAX_CONSECUTIVE_PRESSURES;
+        simulation.arrows.push(ArrowState::new(
+            Side::One,
+            ArrowKind::Shortbow,
+            target.position,
+            0.0,
+            SHORTBOW_ARROW_START_SPEED,
+        ));
+
+        simulation.resolve_player_hits();
+
+        let target = simulation.players()[1];
+        assert_eq!(target.phase, PlayerPhase::Damaged);
+        assert_eq!(target.damage_remaining_frames, 10);
+        assert_eq!(target.pressure_count, SHORTBOW_MAX_CONSECUTIVE_PRESSURES);
+        assert!(target.velocity.x > 0.0);
+    }
+
+    #[test]
+    fn opposing_shortbow_arrows_can_hit_both_players_in_one_frame() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 17);
+        for attacker in [Side::One, Side::Two] {
+            let target_position = simulation.players[attacker.opponent().index()].position;
+            simulation.arrows.push(ArrowState::new(
+                attacker,
+                ArrowKind::Shortbow,
+                target_position,
+                0.0,
+                SHORTBOW_ARROW_START_SPEED,
+            ));
+        }
+
+        simulation.resolve_player_hits();
+
+        assert_eq!(
+            simulation
+                .events
+                .iter()
+                .filter(|event| matches!(event, SimEvent::ShortbowHit { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(simulation.players()[0].pressure_count, 1);
+        assert_eq!(simulation.players()[1].pressure_count, 1);
+    }
+
+    #[test]
+    fn simultaneous_lethal_hits_keep_player_two_win_tiebreak() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 18);
+        for attacker in [Side::One, Side::Two] {
+            let target_position = simulation.players[attacker.opponent().index()].position;
+            simulation.arrows.push(ArrowState::new(
+                attacker,
+                ArrowKind::LongbowHead,
+                target_position,
+                0.0,
+                LONGBOW_SPEED,
+            ));
+        }
+
+        simulation.resolve_player_hits();
+
+        let result = simulation
+            .round_result()
+            .expect("simultaneous lethal hits finish the round");
+        assert_eq!(result.winner(), WinnerSide::SideTwo);
+        assert_eq!(simulation.players()[0].phase, PlayerPhase::Dead);
+        assert_eq!(simulation.players()[1].phase, PlayerPhase::Dead);
+    }
+
+    #[test]
+    fn ending_a_damage_window_resets_its_shortbow_pressure_limit() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 16);
+        simulation.players[0].phase = PlayerPhase::Damaged;
+        simulation.players[0].damage_remaining_frames = 1;
+        simulation.players[0].pressure_count = SHORTBOW_MAX_CONSECUTIVE_PRESSURES;
+        simulation.step([PlayerInput::empty(); 2]);
+
+        let player = simulation.players()[0];
+        assert_eq!(player.phase, PlayerPhase::Move);
+        assert_eq!(player.damage_remaining_frames, 0);
+        assert_eq!(player.pressure_count, 0);
+        assert_eq!(
+            player.damage_end_feedback_frames,
+            DAMAGED_END_FEEDBACK_FRAMES
+        );
+    }
+
+    #[test]
+    fn shortbow_uses_auto_aim_instead_of_manual_mouse_angle() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 11);
+        let input = PlayerInput {
+            shortbow: true,
+            aim_angle: Some(0.0),
+            ..PlayerInput::empty()
+        };
+        simulation.step([input, PlayerInput::empty()]);
+        let arrow = simulation.snapshot().arrows[0];
+        assert!((arrow.rotation_angle + std::f32::consts::FRAC_PI_2).abs() < 0.0001);
+        assert_eq!(SHORTBOW_ARROW_RADIUS, 8.0);
+    }
+
+    #[test]
+    fn longbow_lock_takes_priority_over_manual_angle_for_visible_targets() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 12);
+        let input = PlayerInput {
+            longbow: true,
+            aim_angle: Some(0.0),
+            ..PlayerInput::empty()
+        };
+        simulation.step([input, PlayerInput::empty()]);
+        assert!((simulation.players()[0].aim_angle + std::f32::consts::FRAC_PI_2).abs() < 0.0001);
+    }
+
+    #[test]
+    fn longbow_uses_manual_angle_when_target_is_outside_lock_range() {
+        let config = SimulationConfig {
+            spawn_positions: [Vec2::new(640.0, 620.0), Vec2::new(640.0, 20.0)],
+            ..SimulationConfig::default()
+        };
+        let mut simulation = Simulation::new(config, 13);
+        let input = PlayerInput {
+            longbow: true,
+            aim_angle: Some(0.25),
+            ..PlayerInput::empty()
+        };
+        simulation.step([input, PlayerInput::empty()]);
+        assert_eq!(simulation.players()[0].aim_angle, 0.25);
+    }
+
+    #[test]
+    fn explicit_ai_intercept_aim_overrides_shortbow_auto_aim() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 14);
+        simulation.players[0].phase = PlayerPhase::ShortbowAction;
+        simulation.players[0].shortbow_action_frames = SHORTBOW_ACTION_FRAMES;
+        simulation.arrows.push(ArrowState::new(
+            Side::Two,
+            ArrowKind::Shortbow,
+            Vec2::new(640.0, 570.0),
+            std::f32::consts::FRAC_PI_2,
+            8.0,
+        ));
+        let input = PlayerInput {
+            aim_angle: Some(std::f32::consts::FRAC_PI_2),
+            intercept_aim: true,
+            ..PlayerInput::empty()
+        };
+        simulation.step([input, PlayerInput::empty()]);
+        assert!((simulation.players()[0].aim_angle - std::f32::consts::FRAC_PI_2).abs() < 0.0001);
     }
 
     #[test]
