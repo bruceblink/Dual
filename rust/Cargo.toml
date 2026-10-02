@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/dual-protocol",
     "crates/dual-sim",
+    "crates/dual-client",
 ]
 
 [workspace.package]

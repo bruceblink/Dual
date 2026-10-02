@@ -1,0 +1,15 @@
+[package]
+name = "dual-client"
+version = "0.1.0"
+description = "Macroquad desktop client for the Dual game"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dual-protocol = { path = "../dual-protocol" }
+dual-sim = { path = "../dual-sim" }
+macroquad = "0.4.16"
+
+[lints]
+workspace = true

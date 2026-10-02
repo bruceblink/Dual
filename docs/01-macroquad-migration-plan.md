@@ -230,3 +230,16 @@ Docker 不可用时集成测试标记为未完成，不用 mock 或静态 fixtur
 - 网络读取不在渲染线程执行；关键结果帧不能静默丢弃。
 - 启动时检查必需资源，缺失时输出明确错误。
 - Rust 发布失败时回退到 Java 客户端和 Java Relay，保留迁移分支的阶段提交。
+
+## 8. 实施状态
+
+### 2026-10-02
+
+- 阶段 1 已提交并推送：Rust 协议 crate 覆盖固定帧编码、解码和 Java 格式字节向量。
+- 阶段 2 已实现确定性规则基础，包括固定帧、移动、短弓、长弓、掩体、碰撞、比分、再战和三档 seeded AI。Java/Rust 固定输入回放比较仍未完成，因此阶段 2 尚未验收完成。
+- 阶段 3 当前工作树包含 Macroquad 客户端基础：等比画布映射、固定步长、键鼠瞄准、AI 和本地双人输入、两种场地、暂停、失焦清理、比分与再战。演示、设置/音量、音效和完整视觉反馈仍未实现。
+- Computer Use 在重置后重新初始化并盘点应用，返回的应用列表为空；运行时未提供 `computer.launch_app` 和 `listWindows`，无法绑定或截取 Macroquad 窗口。系统进程检查曾返回窗口标题 `Dual` 和 `Responding=True`，但这不能证明真实画面或鼠标/键盘流程通过。此次仅有 viewport、输入边沿和焦点事件单元测试等 headless 证据。
+- Rust 验证命令：`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 和 `cargo build --workspace` 均通过。协议、规则和客户端共 31 个单元测试通过。
+- Docker 集成测试不适用：当前切片没有外部服务。Java Gradle 回归未在此次 Rust 切片中运行。
+
+阶段 2 和阶段 3 保持未完成状态，直到固定输入回放及本地窗口流程按本计划完成验收。
