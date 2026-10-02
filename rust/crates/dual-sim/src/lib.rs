@@ -661,10 +661,11 @@ impl ArrowState {
             self.speed += (SHORTBOW_ARROW_TERMINAL_SPEED - self.speed) * 0.1;
             self.velocity = Vec2::from_angle(self.rotation_angle).scale(self.speed);
         }
-        if self.position.x < -SHORTBOW_ARROW_RADIUS
-            || self.position.x > ARENA_WIDTH + SHORTBOW_ARROW_RADIUS
-            || self.position.y < -SHORTBOW_ARROW_RADIUS
-            || self.position.y > ARENA_HEIGHT + SHORTBOW_ARROW_RADIUS
+        let radius = self.kind.radius();
+        if self.position.x < -radius
+            || self.position.x > ARENA_WIDTH + radius
+            || self.position.y < -radius
+            || self.position.y > ARENA_HEIGHT + radius
         {
             self.removed = true;
         }
@@ -1008,6 +1009,9 @@ impl Simulation {
 
     fn update_damaged_player(&mut self, index: usize) {
         let player = &mut self.players[index];
+        player.position = player.position.plus(player.velocity);
+        player.velocity.x *= PLAYER_FRICTION;
+        player.velocity.y *= PLAYER_FRICTION;
         player.damage_remaining_frames = player.damage_remaining_frames.saturating_sub(1);
         if player.damage_remaining_frames == 0 {
             player.pressure_count = 0;
@@ -1345,6 +1349,8 @@ mod tests {
         assert_eq!(target.phase, PlayerPhase::Damaged);
         assert_eq!(target.damage_remaining_frames, DAMAGED_FRAMES);
         assert!(target.velocity.y < 0.0);
+        simulation.step([PlayerInput::empty(), PlayerInput::empty()]);
+        assert!(simulation.players()[1].position.y < 580.0);
     }
 
     #[test]
