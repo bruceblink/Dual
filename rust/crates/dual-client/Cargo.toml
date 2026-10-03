@@ -10,6 +10,7 @@ rust-version.workspace = true
 dual-protocol = { path = "../dual-protocol" }
 dual-sim = { path = "../dual-sim" }
 macroquad = "0.4.16"
+rodio = { version = "0.21.1", default-features = false, features = ["playback"] }
 
 [lints]
 workspace = true

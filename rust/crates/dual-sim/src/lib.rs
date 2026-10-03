@@ -716,6 +716,7 @@ impl MatchScore {
 pub enum SimEvent {
     ShortbowFired { attacker: Side },
     LongbowFired { attacker: Side },
+    LongbowChargeReady { attacker: Side },
     ShortbowHit { attacker: Side, target: Side },
     LongbowHit { attacker: Side, target: Side },
     ArrowIntercepted { position: Vec2 },
@@ -878,6 +879,11 @@ impl Simulation {
         }
     }
 
+    /// Exposes this frame's events without allocating a cloned render snapshot.
+    pub fn events(&self) -> &[SimEvent] {
+        &self.events
+    }
+
     pub fn round_result(&self) -> Option<RoundResult> {
         self.last_round_result
     }
@@ -1038,8 +1044,14 @@ impl Simulation {
         self.update_aim(index, input, true);
         self.apply_movement(index, input, LONGBOW_CHARGE_MOVE_RATIO);
         if input.longbow {
-            self.players[index].longbow_charge_frames =
-                (self.players[index].longbow_charge_frames + 1).min(LONGBOW_CHARGE_FRAMES);
+            let previous_charge = self.players[index].longbow_charge_frames;
+            let charge_frames = (previous_charge + 1).min(LONGBOW_CHARGE_FRAMES);
+            self.players[index].longbow_charge_frames = charge_frames;
+            if previous_charge < LONGBOW_CHARGE_FRAMES && charge_frames == LONGBOW_CHARGE_FRAMES {
+                self.events.push(SimEvent::LongbowChargeReady {
+                    attacker: self.players[index].side,
+                });
+            }
             return;
         }
 
@@ -1634,6 +1646,38 @@ mod tests {
         let frozen = simulation.snapshot();
         simulation.step([held, held]);
         assert_eq!(simulation.snapshot(), frozen);
+    }
+
+    #[test]
+    fn longbow_charge_ready_emits_one_event_at_the_threshold() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 44);
+        let charging = PlayerInput {
+            longbow: true,
+            ..PlayerInput::empty()
+        };
+        let mut ready_events = 0;
+
+        for _ in 0..LONGBOW_CHARGE_FRAMES {
+            simulation.step([charging, PlayerInput::empty()]);
+            ready_events += simulation
+                .events()
+                .iter()
+                .filter(|event| {
+                    **event
+                        == SimEvent::LongbowChargeReady {
+                            attacker: Side::One,
+                        }
+                })
+                .count();
+        }
+        assert_eq!(ready_events, 1);
+
+        simulation.step([charging, PlayerInput::empty()]);
+        assert!(
+            !simulation.events().contains(&SimEvent::LongbowChargeReady {
+                attacker: Side::One,
+            })
+        );
     }
 
     #[test]

@@ -1,9 +1,14 @@
+use audio_feedback::AudioFeedback;
 use dual_sim::{
     ARENA_HEIGHT, ARENA_WIDTH, AiController, AiDifficulty, ArenaKind, FPS, FrameSnapshot,
-    PLAYER_BODY_SIZE, PlayerInput, PlayerPhase, Side, Simulation, SimulationConfig,
+    PLAYER_BODY_SIZE, PlayerInput, PlayerPhase, Side, SimEvent, Simulation, SimulationConfig,
     Vec2 as WorldVec2,
 };
 use macroquad::prelude::*;
+use settings::AudioSettings;
+
+mod audio_feedback;
+mod settings;
 
 const LOGICAL_STEP_SECONDS: f32 = 1.0 / FPS as f32;
 const MAX_CATCH_UP_STEPS: usize = 8;
@@ -16,6 +21,26 @@ enum GameMode {
     Demo,
     VersusAi,
     LocalTwoPlayer,
+}
+
+/// Carries presentation-only state from the loop into the immutable-snapshot HUD.
+struct HudState<'a> {
+    mode_label: &'a str,
+    arena: ArenaKind,
+    game_mode: GameMode,
+    paused: bool,
+    settings_open: bool,
+    audio_volume_label: &'a str,
+}
+
+/// Defines the clickable actions on the settings overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsPointerAction {
+    Open,
+    Close,
+    DecreaseVolume,
+    ToggleMute,
+    IncreaseVolume,
 }
 
 /// Retains one-frame weapon presses until the next fixed simulation tick.
@@ -168,6 +193,7 @@ fn window_conf() -> Conf {
 /// Runs input collection, the bounded fixed-step simulation loop, and snapshot rendering.
 #[macroquad::main(window_conf)]
 async fn main() {
+    let audio_feedback = AudioFeedback::start();
     let mut arena = ArenaKind::Open;
     let mut difficulty = AiDifficulty::Standard;
     let mut game_mode = GameMode::Demo;
@@ -175,6 +201,8 @@ async fn main() {
     let mut ai = create_ai_pair(game_mode, difficulty, simulation.seed());
     let mut accumulator = 0.0;
     let mut paused = false;
+    let mut settings_open = false;
+    let mut audio_settings = AudioSettings::default();
     let mut press_edges = PressEdges::default();
     let mut focus_events = WindowFocusEvents::default();
     let focus_subscriber = macroquad::input::utils::register_input_subscriber();
@@ -187,45 +215,74 @@ async fn main() {
             accumulator = 0.0;
             press_edges.clear();
         }
-        if is_key_pressed(KeyCode::P) {
-            paused = !paused;
-        }
+        let settings_was_open = settings_open;
         let mut reset_match = false;
-        if is_key_pressed(KeyCode::Key1) {
-            difficulty = AiDifficulty::Basic;
-            game_mode = GameMode::VersusAi;
-            reset_match = true;
-        } else if is_key_pressed(KeyCode::Key2) {
-            difficulty = AiDifficulty::Standard;
-            game_mode = GameMode::VersusAi;
-            reset_match = true;
-        } else if is_key_pressed(KeyCode::Key3) {
-            difficulty = AiDifficulty::Advanced;
-            game_mode = GameMode::VersusAi;
-            reset_match = true;
-        } else if is_key_pressed(KeyCode::Key4) {
-            game_mode = GameMode::LocalTwoPlayer;
-            reset_match = true;
-        } else if is_key_pressed(KeyCode::M) {
-            game_mode = GameMode::Demo;
-            reset_match = true;
-        }
-        if is_key_pressed(KeyCode::C) {
-            arena = match arena {
-                ArenaKind::Open => ArenaKind::CentralCover,
-                ArenaKind::CentralCover => ArenaKind::Open,
-            };
-            reset_match = true;
-        }
-        if reset_match {
-            simulation = new_simulation(arena);
-            ai = create_ai_pair(game_mode, difficulty, simulation.seed());
-            paused = false;
+        if settings_open {
+            if is_key_pressed(KeyCode::Escape) {
+                settings_open = false;
+            } else if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd) {
+                audio_settings.increase_volume();
+            } else if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract) {
+                audio_settings.decrease_volume();
+            } else if is_key_pressed(KeyCode::M) {
+                audio_settings.toggle_mute();
+            } else if let Some(action) = settings_pointer_action(viewport, true) {
+                match action {
+                    SettingsPointerAction::DecreaseVolume => audio_settings.decrease_volume(),
+                    SettingsPointerAction::ToggleMute => audio_settings.toggle_mute(),
+                    SettingsPointerAction::IncreaseVolume => audio_settings.increase_volume(),
+                    SettingsPointerAction::Close => settings_open = false,
+                    SettingsPointerAction::Open => {}
+                }
+            }
             accumulator = 0.0;
             press_edges.clear();
+        } else if is_key_pressed(KeyCode::O)
+            || settings_pointer_action(viewport, false) == Some(SettingsPointerAction::Open)
+        {
+            settings_open = true;
+            accumulator = 0.0;
+            press_edges.clear();
+        } else {
+            if is_key_pressed(KeyCode::P) {
+                paused = !paused;
+            }
+            if is_key_pressed(KeyCode::Key1) {
+                difficulty = AiDifficulty::Basic;
+                game_mode = GameMode::VersusAi;
+                reset_match = true;
+            } else if is_key_pressed(KeyCode::Key2) {
+                difficulty = AiDifficulty::Standard;
+                game_mode = GameMode::VersusAi;
+                reset_match = true;
+            } else if is_key_pressed(KeyCode::Key3) {
+                difficulty = AiDifficulty::Advanced;
+                game_mode = GameMode::VersusAi;
+                reset_match = true;
+            } else if is_key_pressed(KeyCode::Key4) {
+                game_mode = GameMode::LocalTwoPlayer;
+                reset_match = true;
+            } else if is_key_pressed(KeyCode::M) {
+                game_mode = GameMode::Demo;
+                reset_match = true;
+            }
+            if is_key_pressed(KeyCode::C) {
+                arena = match arena {
+                    ArenaKind::Open => ArenaKind::CentralCover,
+                    ArenaKind::CentralCover => ArenaKind::Open,
+                };
+                reset_match = true;
+            }
+            if reset_match {
+                simulation = new_simulation(arena);
+                ai = create_ai_pair(game_mode, difficulty, simulation.seed());
+                paused = false;
+                accumulator = 0.0;
+                press_edges.clear();
+            }
         }
 
-        if paused {
+        if paused || settings_open || settings_was_open {
             press_edges.clear();
         } else {
             press_edges.capture(
@@ -235,11 +292,15 @@ async fn main() {
             );
         }
 
-        if !paused {
+        let settings_transition_freeze = settings_open || settings_was_open;
+        if should_advance_simulation(paused, settings_transition_freeze) {
             accumulator += get_frame_time().min(0.25);
         }
         let mut steps = 0;
-        while !paused && accumulator >= LOGICAL_STEP_SECONDS && steps < MAX_CATCH_UP_STEPS {
+        while should_advance_simulation(paused, settings_transition_freeze)
+            && accumulator >= LOGICAL_STEP_SECONDS
+            && steps < MAX_CATCH_UP_STEPS
+        {
             let snapshot = simulation.snapshot();
             let player_one_input = if let Some(ai) = &mut ai[0] {
                 ai.next_input(&snapshot)
@@ -254,6 +315,15 @@ async fn main() {
                 PlayerInput::empty()
             };
             simulation.step([player_one_input, player_two_input]);
+            if simulation.events().contains(&SimEvent::LongbowChargeReady {
+                attacker: Side::One,
+            }) || simulation.events().contains(&SimEvent::LongbowChargeReady {
+                attacker: Side::Two,
+            }) {
+                if let Some(audio_feedback) = &audio_feedback {
+                    audio_feedback.play_charge_ready(audio_settings.volume());
+                }
+            }
             accumulator -= LOGICAL_STEP_SECONDS;
             steps += 1;
         }
@@ -261,7 +331,7 @@ async fn main() {
             accumulator = accumulator.min(LOGICAL_STEP_SECONDS);
         }
 
-        if is_key_pressed(KeyCode::R) {
+        if !settings_open && is_key_pressed(KeyCode::R) {
             if simulation.round_result().is_some() && simulation.score().is_complete() {
                 simulation = new_simulation(arena);
                 ai = create_ai_pair(game_mode, difficulty, simulation.seed());
@@ -286,10 +356,14 @@ async fn main() {
             &simulation,
             &simulation.snapshot(),
             viewport,
-            mode_label,
-            arena,
-            game_mode,
-            paused,
+            HudState {
+                mode_label,
+                arena,
+                game_mode,
+                paused,
+                settings_open,
+                audio_volume_label: audio_settings.label(),
+            },
         );
         next_frame().await;
     }
@@ -320,6 +394,64 @@ fn new_simulation(arena: ArenaKind) -> Simulation {
         },
         MATCH_SEED,
     )
+}
+
+/// Settings and pause overlays both freeze rule time without changing match state.
+fn should_advance_simulation(paused: bool, settings_open: bool) -> bool {
+    !paused && !settings_open
+}
+
+/// Turns the settings button and overlay hit targets into presentation-only menu actions.
+fn settings_pointer_action(
+    viewport: Viewport,
+    settings_open: bool,
+) -> Option<SettingsPointerAction> {
+    if !is_mouse_button_pressed(MouseButton::Left) {
+        return None;
+    }
+    let (mouse_x, mouse_y) = mouse_position();
+    let point = viewport.screen_to_world(vec2(mouse_x, mouse_y));
+    if settings_open {
+        [
+            (
+                SettingsPointerAction::DecreaseVolume,
+                WorldVec2::new(500.0, 380.0),
+                116.0,
+                48.0,
+            ),
+            (
+                SettingsPointerAction::ToggleMute,
+                WorldVec2::new(640.0, 380.0),
+                180.0,
+                48.0,
+            ),
+            (
+                SettingsPointerAction::IncreaseVolume,
+                WorldVec2::new(780.0, 380.0),
+                116.0,
+                48.0,
+            ),
+            (
+                SettingsPointerAction::Close,
+                WorldVec2::new(640.0, 500.0),
+                240.0,
+                48.0,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(action, center, width, height)| {
+            point_in_button(point, center, width, height).then_some(action)
+        })
+    } else {
+        point_in_button(point, WorldVec2::new(1180.0, 44.0), 152.0, 40.0)
+            .then_some(SettingsPointerAction::Open)
+    }
+}
+
+/// Checks a rules-world point against one centered menu button rectangle.
+fn point_in_button(point: WorldVec2, center: WorldVec2, width: f32, height: f32) -> bool {
+    (center.x - width * 0.5..=center.x + width * 0.5).contains(&point.x)
+        && (center.y - height * 0.5..=center.y + height * 0.5).contains(&point.y)
 }
 
 /// Samples movement, aim, and the already-latched shortbow edge for player one.
@@ -364,10 +496,7 @@ fn draw_snapshot(
     simulation: &Simulation,
     snapshot: &FrameSnapshot,
     viewport: Viewport,
-    mode_label: &str,
-    arena: ArenaKind,
-    game_mode: GameMode,
-    paused: bool,
+    hud: HudState<'_>,
 ) {
     let arena_top_left = viewport.world_to_screen(WorldVec2::new(0.0, 0.0));
     draw_rectangle(
@@ -393,7 +522,7 @@ fn draw_snapshot(
             viewport,
         );
     }
-    draw_hud(snapshot, viewport, mode_label, arena, game_mode, paused);
+    draw_hud(snapshot, viewport, hud);
 }
 
 /// Draws the arena grid inside the letterboxed logical canvas.
@@ -528,15 +657,8 @@ fn draw_player(
 }
 
 /// Displays match state, controls, pause feedback, and the completed-round prompt.
-fn draw_hud(
-    snapshot: &FrameSnapshot,
-    viewport: Viewport,
-    mode_label: &str,
-    arena: ArenaKind,
-    game_mode: GameMode,
-    paused: bool,
-) {
-    let (player_one_label, player_two_label) = if game_mode == GameMode::LocalTwoPlayer {
+fn draw_hud(snapshot: &FrameSnapshot, viewport: Viewport, hud: HudState<'_>) {
+    let (player_one_label, player_two_label) = if hud.game_mode == GameMode::LocalTwoPlayer {
         ("PLAYER 1", "PLAYER 2")
     } else {
         ("YOU", "RIVAL")
@@ -555,12 +677,12 @@ fn draw_hud(
         viewport.logical_size(20.0),
         WHITE,
     );
-    let controls = match game_mode {
-        GameMode::Demo => "DEMO: AI vs AI  |  1-3 play vs AI  4 local duel  M demo",
+    let controls = match hud.game_mode {
+        GameMode::Demo => "DEMO: AI vs AI  |  1-3 vs AI  4 local duel  M demo  O settings",
         GameMode::VersusAi => {
-            "WASD move / mouse aim / Z or click: shortbow / X or right click: longbow"
+            "WASD move / mouse aim / Z or click: shortbow / X or right click: longbow  O settings"
         }
-        GameMode::LocalTwoPlayer => "P1: WASD / mouse / Z-X     P2: IJKL / B-V",
+        GameMode::LocalTwoPlayer => "P1: WASD / mouse / Z-X     P2: IJKL / B-V  O settings",
     };
     draw_text(
         controls,
@@ -569,10 +691,18 @@ fn draw_hud(
         viewport.logical_size(15.0),
         Color::from_rgba(224, 224, 224, 220),
     );
+    draw_menu_button(
+        viewport,
+        WorldVec2::new(1180.0, 44.0),
+        152.0,
+        40.0,
+        "SETTINGS",
+    );
     draw_text(
         format!(
-            "{mode_label}  |  {}  |  1-3 AI  4 local duel  C arena  P pause  R reset",
-            if arena == ArenaKind::CentralCover {
+            "{}  |  {}  |  C arena  P pause  R reset",
+            hud.mode_label,
+            if hud.arena == ArenaKind::CentralCover {
                 "CENTRAL COVER"
             } else {
                 "OPEN"
@@ -583,7 +713,7 @@ fn draw_hud(
         viewport.logical_size(14.0),
         Color::from_rgba(232, 192, 96, 255),
     );
-    if paused {
+    if hud.paused {
         draw_rectangle(
             viewport.left,
             viewport.top,
@@ -610,7 +740,7 @@ fn draw_hud(
             viewport.logical_size(ARENA_HEIGHT),
             Color::from_rgba(8, 12, 18, 155),
         );
-        let winner = match (result.winner(), game_mode == GameMode::LocalTwoPlayer) {
+        let winner = match (result.winner(), hud.game_mode == GameMode::LocalTwoPlayer) {
             (dual_protocol::WinnerSide::SideOne, true) => "PLAYER 1 WINS THE ROUND",
             (dual_protocol::WinnerSide::SideTwo, true) => "PLAYER 2 WINS THE ROUND",
             (dual_protocol::WinnerSide::SideOne, false) => "YOU WIN THE ROUND",
@@ -640,6 +770,88 @@ fn draw_hud(
             Color::from_rgba(232, 192, 96, 255),
         );
     }
+    if hud.settings_open {
+        draw_settings_overlay(viewport, hud.audio_volume_label);
+    }
+}
+
+/// Shows volume controls above the frozen match without resetting the current round.
+fn draw_settings_overlay(viewport: Viewport, audio_volume_label: &str) {
+    draw_rectangle(
+        viewport.left,
+        viewport.top,
+        viewport.logical_size(ARENA_WIDTH),
+        viewport.logical_size(ARENA_HEIGHT),
+        Color::from_rgba(8, 12, 18, 255),
+    );
+    let center_x = viewport.left + viewport.logical_size(ARENA_WIDTH) * 0.5;
+    let title = "SETTINGS";
+    let title_size = viewport.logical_size(38.0);
+    let title_measure = measure_text(title, None, title_size as u16, 1.0);
+    draw_text(
+        title,
+        center_x - title_measure.width * 0.5,
+        viewport.top + viewport.logical_size(270.0),
+        title_size,
+        WHITE,
+    );
+    let volume = format!("VOLUME  {audio_volume_label}");
+    let volume_size = viewport.logical_size(26.0);
+    let volume_measure = measure_text(&volume, None, volume_size as u16, 1.0);
+    draw_text(
+        &volume,
+        center_x - volume_measure.width * 0.5,
+        viewport.top + viewport.logical_size(330.0),
+        volume_size,
+        Color::from_rgba(232, 192, 96, 255),
+    );
+    draw_menu_button(viewport, WorldVec2::new(500.0, 380.0), 116.0, 48.0, "-");
+    draw_menu_button(viewport, WorldVec2::new(640.0, 380.0), 180.0, 48.0, "MUTE");
+    draw_menu_button(viewport, WorldVec2::new(780.0, 380.0), 116.0, 48.0, "+");
+    let controls = "Click - / + to change volume, M to mute";
+    let controls_size = viewport.logical_size(18.0);
+    let controls_measure = measure_text(controls, None, controls_size as u16, 1.0);
+    draw_text(
+        controls,
+        center_x - controls_measure.width * 0.5,
+        viewport.top + viewport.logical_size(444.0),
+        controls_size,
+        Color::from_rgba(224, 224, 224, 255),
+    );
+    draw_menu_button(viewport, WorldVec2::new(640.0, 500.0), 240.0, 48.0, "BACK");
+}
+
+/// Draws a scaled button that shares the hit-box coordinates used by the settings input path.
+fn draw_menu_button(viewport: Viewport, center: WorldVec2, width: f32, height: f32, label: &str) {
+    let top_left = viewport.world_to_screen(WorldVec2::new(
+        center.x - width * 0.5,
+        center.y - height * 0.5,
+    ));
+    draw_rectangle(
+        top_left.x,
+        top_left.y,
+        viewport.logical_size(width),
+        viewport.logical_size(height),
+        Color::from_rgba(36, 44, 56, 240),
+    );
+    draw_rectangle_lines(
+        top_left.x,
+        top_left.y,
+        viewport.logical_size(width),
+        viewport.logical_size(height),
+        viewport.logical_size(2.0),
+        Color::from_rgba(96, 208, 232, 200),
+    );
+    let font_size = viewport.logical_size(18.0);
+    let measurement = measure_text(label, None, font_size as u16, 1.0);
+    let center_screen = viewport.world_to_screen(center);
+    draw_text(
+        label,
+        center_screen.x - measurement.width * 0.5,
+        center_screen.y + measurement.height * 0.35,
+        font_size,
+        WHITE,
+    );
 }
 
 #[cfg(test)]
@@ -722,5 +934,37 @@ mod tests {
 
         let local = create_ai_pair(GameMode::LocalTwoPlayer, AiDifficulty::Advanced, MATCH_SEED);
         assert!(local.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn pause_and_settings_overlays_freeze_the_simulation() {
+        assert!(should_advance_simulation(false, false));
+        assert!(!should_advance_simulation(true, false));
+        assert!(!should_advance_simulation(false, true));
+        assert!(!should_advance_simulation(true, true));
+    }
+
+    #[test]
+    fn settings_buttons_use_centered_world_space_hit_boxes() {
+        let minus = WorldVec2::new(500.0, 380.0);
+        assert!(point_in_button(minus, minus, 116.0, 48.0));
+        assert!(point_in_button(
+            WorldVec2::new(558.0, 404.0),
+            minus,
+            116.0,
+            48.0
+        ));
+        assert!(!point_in_button(
+            WorldVec2::new(558.1, 404.0),
+            minus,
+            116.0,
+            48.0
+        ));
+        assert!(!point_in_button(
+            WorldVec2::new(640.0, 380.0),
+            minus,
+            116.0,
+            48.0
+        ));
     }
 }
