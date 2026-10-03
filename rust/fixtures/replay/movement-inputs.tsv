@@ -1,0 +1,5 @@
+# Inclusive frame ranges; buttons use up=0x01, down=0x02, left=0x04, right=0x08.
+0	14	9	6
+15	109	8	4
+110	139	2	1
+140	179	0	0
