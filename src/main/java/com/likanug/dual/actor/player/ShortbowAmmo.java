@@ -28,6 +28,10 @@ public final class ShortbowAmmo {
         return maximumAmmo;
     }
 
+    public int getRecoveryFrameCount() {
+        return recoveryProgressFrameCount;
+    }
+
     /** Returns the current recovery fraction for the next arrow, or zero while the reserve is full. */
     public float getRecoveryProgressRatio() {
         if (availableAmmo >= maximumAmmo) return 0.0F;

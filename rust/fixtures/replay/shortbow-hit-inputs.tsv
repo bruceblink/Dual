@@ -1,0 +1,7 @@
+# Inclusive frame ranges; buttons use up=1, down=2, left=4, right=8, shortbow=16, longbow=32.
+0	0	16	0
+1	11	0	0
+12	12	16	0
+13	23	0	0
+24	24	16	0
+25	119	0	0

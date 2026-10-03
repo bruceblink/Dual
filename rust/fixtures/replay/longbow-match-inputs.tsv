@@ -1,0 +1,7 @@
+# Round, inclusive local frame range, player masks (up=1, down=2, left=4, right=8, shortbow=16, longbow=32).
+1	0	29	32	0
+1	30	59	0	0
+2	0	29	32	0
+2	30	59	0	0
+3	0	29	32	0
+3	30	59	0	0

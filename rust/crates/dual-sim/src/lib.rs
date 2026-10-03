@@ -9,8 +9,11 @@
 use dual_protocol::{RoundResult, WinnerSide};
 
 mod ai;
+mod tactical;
 
 pub use ai::{AiController, AiDifficulty, AiPlan};
+use tactical::TacticalEventRecorder;
+pub use tactical::{TacticalEvent, TacticalEventKind};
 
 pub const FPS: u32 = 60;
 pub const ARENA_WIDTH: f32 = 1_280.0;
@@ -32,6 +35,7 @@ pub const SHORTBOW_MAX_AMMO: u8 = 3;
 pub const SHORTBOW_AMMO_RECOVERY_FRAMES: u16 = 60;
 pub const SHORTBOW_FIRE_INTERVAL_FRAMES: u16 = 12;
 pub const SHORTBOW_ACTION_FRAMES: u16 = 4;
+pub const TACTICAL_OPENING_WINDOW_FRAMES: u64 = 90;
 pub const LONGBOW_SPEED: f32 = 64.0;
 pub const LONGBOW_COMPONENT_INTERVAL: f32 = 24.0;
 pub const LONGBOW_SHAFT_COUNT: usize = 5;
@@ -672,10 +676,12 @@ impl ArrowState {
 
     fn update(&mut self) {
         self.previous_position = self.position;
+        if self.kind == ArrowKind::Shortbow {
+            self.velocity = Vec2::from_angle(self.rotation_angle).scale(self.speed);
+        }
         self.position = self.position.plus(self.velocity);
         if self.kind == ArrowKind::Shortbow {
             self.speed += (SHORTBOW_ARROW_TERMINAL_SPEED - self.speed) * 0.1;
-            self.velocity = Vec2::from_angle(self.rotation_angle).scale(self.speed);
         }
         let radius = self.kind.radius();
         if self.position.x < -radius
@@ -719,6 +725,7 @@ pub enum SimEvent {
     LongbowChargeReady { attacker: Side },
     ShortbowHit { attacker: Side, target: Side },
     LongbowHit { attacker: Side, target: Side },
+    Tactical(TacticalEvent),
     ArrowIntercepted { position: Vec2 },
     CoverImpact { position: Vec2, normal: Vec2 },
 }
@@ -826,6 +833,7 @@ pub struct Simulation {
     last_round_result: Option<RoundResult>,
     previous_shortbow: [bool; 2],
     buffered_shortbow_frames: [u16; 2],
+    tactical_events: TacticalEventRecorder,
     events: Vec<SimEvent>,
 }
 
@@ -845,6 +853,7 @@ impl Simulation {
             last_round_result: None,
             previous_shortbow: [false; 2],
             buffered_shortbow_frames: [0; 2],
+            tactical_events: TacticalEventRecorder::default(),
             events: Vec::new(),
         }
     }
@@ -892,6 +901,11 @@ impl Simulation {
         self.score
     }
 
+    /// Reports whether this side still has a pressure-created longbow opening.
+    pub fn has_tactical_opening(&self, side: Side) -> bool {
+        self.tactical_events.has_active_opening(side, self.frame)
+    }
+
     pub fn players(&self) -> [PlayerSnapshot; 2] {
         [self.players[0].into(), self.players[1].into()]
     }
@@ -927,6 +941,7 @@ impl Simulation {
         self.last_round_result = None;
         self.previous_shortbow = [false; 2];
         self.buffered_shortbow_frames = [0; 2];
+        self.tactical_events.reset();
         self.events.clear();
     }
 
@@ -1027,6 +1042,13 @@ impl Simulation {
             self.update_aim(index, input, true);
             self.players[index].phase = PlayerPhase::LongbowCharge;
             self.players[index].longbow_charge_frames = 1;
+            let side = self.players[index].side;
+            if let Some(event) = self
+                .tactical_events
+                .record_longbow_charge_started(side, self.frame.saturating_add(1))
+            {
+                self.events.push(SimEvent::Tactical(event));
+            }
         }
     }
 
@@ -1058,6 +1080,9 @@ impl Simulation {
         if self.players[index].longbow_charge_frames >= LONGBOW_CHARGE_FRAMES {
             self.fire_longbow(index);
         } else {
+            let side = self.players[index].side;
+            self.tactical_events
+                .record_longbow_charge_cancelled(side, self.frame.saturating_add(1));
             self.players[index].longbow_charge_frames = 0;
             self.players[index].phase = PlayerPhase::Move;
         }
@@ -1252,6 +1277,10 @@ impl Simulation {
             self.arrows[first_index].removed = true;
             self.arrows[second_index].removed = true;
             self.events.push(SimEvent::ArrowIntercepted { position });
+            self.events
+                .push(SimEvent::Tactical(TacticalEvent::intercept(
+                    self.frame.saturating_add(1),
+                )));
         }
     }
 
@@ -1281,6 +1310,12 @@ impl Simulation {
                 if arrow.kind.is_lethal() {
                     self.players[target.index()].phase = PlayerPhase::Dead;
                     self.events.push(SimEvent::LongbowHit { attacker, target });
+                    if let Some(event) = self
+                        .tactical_events
+                        .record_longbow_finish(attacker, self.frame.saturating_add(1))
+                    {
+                        self.events.push(SimEvent::Tactical(event));
+                    }
                     break;
                 }
 
@@ -1288,15 +1323,35 @@ impl Simulation {
                     .velocity
                     .normalized_or(Vec2::from_angle(arrow.rotation_angle))
                     .scale(PLAYER_THRUST_SPEED);
+                let charge_interrupted =
+                    self.players[target.index()].phase == PlayerPhase::LongbowCharge;
+                let pressure_refreshed = self.players[target.index()].pressure_count
+                    < SHORTBOW_MAX_CONSECUTIVE_PRESSURES;
                 let target_player = &mut self.players[target.index()];
                 target_player.velocity = thrust;
-                if target_player.pressure_count < SHORTBOW_MAX_CONSECUTIVE_PRESSURES {
+                target_player.phase = PlayerPhase::Damaged;
+                if pressure_refreshed {
                     target_player.pressure_count += 1;
-                    target_player.phase = PlayerPhase::Damaged;
                     target_player.damage_remaining_frames = DAMAGED_FRAMES;
                     target_player.damage_end_feedback_frames = 0;
                 }
+                if charge_interrupted && pressure_refreshed {
+                    target_player.longbow_charge_frames = 0;
+                    self.tactical_events
+                        .record_longbow_charge_cancelled(target, self.frame.saturating_add(1));
+                }
                 self.events.push(SimEvent::ShortbowHit { attacker, target });
+                let pressure_event = self
+                    .tactical_events
+                    .record_pressure(attacker, self.frame.saturating_add(1));
+                self.events.push(SimEvent::Tactical(pressure_event));
+                if charge_interrupted {
+                    self.events.push(SimEvent::Tactical(TacticalEvent::for_side(
+                        attacker,
+                        TacticalEventKind::Disrupt,
+                        self.frame.saturating_add(1),
+                    )));
+                }
             }
         }
 
