@@ -9,13 +9,17 @@ use settings::AudioSettings;
 
 mod audio_feedback;
 mod effects;
+mod hud;
 mod settings;
 
 use effects::VisualEffects;
+use hud::TacticalFeedback;
 
 const LOGICAL_STEP_SECONDS: f32 = 1.0 / FPS as f32;
 const MAX_CATCH_UP_STEPS: usize = 8;
 const MAX_PRESS_EDGE_RENDER_FRAMES: u8 = 8;
+const DEMO_RESULT_DURATION_SECONDS: f32 = 3.0;
+const ROUND_START_COUNTDOWN_SECONDS: f32 = 3.0;
 const MATCH_SEED: u64 = 0x4455_414c;
 
 /// Selects which input producers own the two simulation sides.
@@ -34,6 +38,8 @@ struct HudState<'a> {
     paused: bool,
     settings_open: bool,
     audio_volume_label: &'a str,
+    tactical_feedback: Option<hud::TacticalFeedbackDisplay>,
+    round_countdown: Option<u8>,
 }
 
 /// Defines the clickable actions on the settings overlay.
@@ -111,6 +117,81 @@ impl PressEdges {
 #[derive(Default)]
 struct WindowFocusEvents {
     lost_focus: bool,
+}
+
+/// Keeps demo results visible briefly before automatically starting another match.
+#[derive(Default)]
+struct DemoResultTimer {
+    elapsed_seconds: f32,
+}
+
+impl DemoResultTimer {
+    /// Matches the Java demo's three-second result interval and freezes under overlays.
+    fn update(
+        &mut self,
+        mode: GameMode,
+        has_round_result: bool,
+        frozen: bool,
+        frame_seconds: f32,
+    ) -> bool {
+        if mode != GameMode::Demo || !has_round_result {
+            self.elapsed_seconds = 0.0;
+            return false;
+        }
+        if !frozen {
+            self.elapsed_seconds += frame_seconds.clamp(0.0, 0.25);
+        }
+        !frozen && self.elapsed_seconds >= DEMO_RESULT_DURATION_SECONDS
+    }
+
+    /// Clears the elapsed portion when the demo advances to another match.
+    fn reset(&mut self) {
+        self.elapsed_seconds = 0.0;
+    }
+}
+
+/// Freezes combat for the same three-second ready countdown used by the Java client.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RoundStartTimer {
+    elapsed_seconds: f32,
+    active: bool,
+}
+
+impl Default for RoundStartTimer {
+    fn default() -> Self {
+        Self {
+            elapsed_seconds: 0.0,
+            active: true,
+        }
+    }
+}
+
+impl RoundStartTimer {
+    /// Starts a fresh 3-2-1 interval after launch or a round reset.
+    fn begin(&mut self) {
+        self.elapsed_seconds = 0.0;
+        self.active = true;
+    }
+
+    /// Advances only while gameplay overlays are closed, with a bounded frame delta.
+    fn advance(&mut self, frame_seconds: f32, frozen: bool) {
+        if self.active && !frozen {
+            self.elapsed_seconds = (self.elapsed_seconds + frame_seconds.clamp(0.0, 0.25))
+                .min(ROUND_START_COUNTDOWN_SECONDS);
+            if self.elapsed_seconds >= ROUND_START_COUNTDOWN_SECONDS {
+                self.active = false;
+            }
+        }
+    }
+
+    /// Returns the visible 3, 2, or 1 while combat remains frozen.
+    fn displayed_number(self) -> Option<u8> {
+        if !self.active {
+            return None;
+        }
+        let remaining = ROUND_START_COUNTDOWN_SECONDS - self.elapsed_seconds;
+        Some(remaining.ceil().clamp(1.0, 3.0) as u8)
+    }
 }
 
 impl WindowFocusEvents {
@@ -207,6 +288,9 @@ async fn main() {
     let mut settings_open = false;
     let mut audio_settings = AudioSettings::default();
     let mut visual_effects = VisualEffects::default();
+    let mut tactical_feedback = TacticalFeedback::default();
+    let mut demo_result_timer = DemoResultTimer::default();
+    let mut round_start_timer = RoundStartTimer::default();
     let mut press_edges = PressEdges::default();
     let mut focus_events = WindowFocusEvents::default();
     let focus_subscriber = macroquad::input::utils::register_input_subscriber();
@@ -215,7 +299,9 @@ async fn main() {
         let viewport = Viewport::from_window();
         macroquad::input::utils::repeat_all_miniquad_input(&mut focus_events, focus_subscriber);
         if focus_events.take_lost_focus() {
-            paused = true;
+            if should_pause_on_focus_loss(game_mode) {
+                paused = true;
+            }
             accumulator = 0.0;
             press_edges.clear();
         }
@@ -281,13 +367,16 @@ async fn main() {
                 simulation = new_simulation(arena);
                 ai = create_ai_pair(game_mode, difficulty, simulation.seed());
                 visual_effects.clear();
+                tactical_feedback.clear();
                 paused = false;
                 accumulator = 0.0;
+                demo_result_timer.reset();
+                round_start_timer.begin();
                 press_edges.clear();
             }
         }
 
-        if paused || settings_open || settings_was_open {
+        if paused || settings_open || settings_was_open || round_start_timer.active {
             press_edges.clear();
         } else {
             press_edges.capture(
@@ -298,11 +387,14 @@ async fn main() {
         }
 
         let settings_transition_freeze = settings_open || settings_was_open;
-        if should_advance_simulation(paused, settings_transition_freeze) {
+        if should_advance_simulation(paused, settings_transition_freeze)
+            && !round_start_timer.active
+        {
             accumulator += get_frame_time().min(0.25);
         }
         let mut steps = 0;
         while should_advance_simulation(paused, settings_transition_freeze)
+            && !round_start_timer.active
             && accumulator >= LOGICAL_STEP_SECONDS
             && steps < MAX_CATCH_UP_STEPS
         {
@@ -321,6 +413,7 @@ async fn main() {
             };
             simulation.step([player_one_input, player_two_input]);
             visual_effects.advance(&simulation.snapshot());
+            tactical_feedback.record(simulation.events());
             if simulation.events().contains(&SimEvent::LongbowChargeReady {
                 attacker: Side::One,
             }) || simulation.events().contains(&SimEvent::LongbowChargeReady {
@@ -337,6 +430,11 @@ async fn main() {
             accumulator = accumulator.min(LOGICAL_STEP_SECONDS);
         }
 
+        tactical_feedback.advance(
+            get_frame_time(),
+            paused || settings_open || settings_was_open,
+        );
+
         if !settings_open && is_key_pressed(KeyCode::R) {
             if simulation.round_result().is_some() && simulation.score().is_complete() {
                 simulation = new_simulation(arena);
@@ -345,9 +443,35 @@ async fn main() {
                 simulation.reset_round();
             }
             visual_effects.clear();
+            tactical_feedback.clear();
             accumulator = 0.0;
+            demo_result_timer.reset();
+            round_start_timer.begin();
             press_edges.clear();
         }
+
+        let has_round_result = simulation.round_result().is_some();
+        if demo_result_timer.update(
+            game_mode,
+            has_round_result,
+            paused || settings_open || settings_was_open,
+            get_frame_time(),
+        ) {
+            simulation = new_simulation(arena);
+            ai = create_ai_pair(game_mode, difficulty, simulation.seed());
+            visual_effects.clear();
+            tactical_feedback.clear();
+            paused = false;
+            accumulator = 0.0;
+            demo_result_timer.reset();
+            round_start_timer.begin();
+            press_edges.clear();
+        }
+
+        round_start_timer.advance(
+            get_frame_time(),
+            paused || settings_open || settings_was_open,
+        );
 
         clear_background(Color::from_rgba(24, 28, 36, 255));
         let mode_label = match game_mode {
@@ -371,6 +495,8 @@ async fn main() {
                 paused,
                 settings_open,
                 audio_volume_label: audio_settings.label(),
+                tactical_feedback: tactical_feedback.display(simulation.round_result().is_some()),
+                round_countdown: round_start_timer.displayed_number(),
             },
         );
         next_frame().await;
@@ -407,6 +533,11 @@ fn new_simulation(arena: ArenaKind) -> Simulation {
 /// Settings and pause overlays both freeze rule time without changing match state.
 fn should_advance_simulation(paused: bool, settings_open: bool) -> bool {
     !paused && !settings_open
+}
+
+/// Demo playback continues through focus changes; only active local matches auto-pause.
+fn should_pause_on_focus_loss(game_mode: GameMode) -> bool {
+    game_mode != GameMode::Demo
 }
 
 /// Turns the settings button and overlay hit targets into presentation-only menu actions.
@@ -532,6 +663,7 @@ fn draw_snapshot(
         );
     }
     visual_effects.draw(viewport.left, viewport.top, viewport.scale);
+    hud::draw_combat_status(snapshot, viewport, hud.game_mode);
     draw_hud(snapshot, viewport, hud);
 }
 
@@ -756,11 +888,6 @@ fn draw_hud(snapshot: &FrameSnapshot, viewport: Viewport, hud: HudState<'_>) {
             (dual_protocol::WinnerSide::SideOne, false) => "YOU WIN THE ROUND",
             (dual_protocol::WinnerSide::SideTwo, false) => "RIVAL WINS THE ROUND",
         };
-        let completed = if result.match_complete() {
-            "MATCH COMPLETE - PRESS R TO PLAY AGAIN"
-        } else {
-            "PRESS R TO START THE NEXT ROUND"
-        };
         let winner_size = viewport.logical_size(42.0);
         let winner_measure = measure_text(winner, None, winner_size as u16, 1.0);
         draw_text(
@@ -770,19 +897,60 @@ fn draw_hud(snapshot: &FrameSnapshot, viewport: Viewport, hud: HudState<'_>) {
             winner_size,
             WHITE,
         );
-        let hint_size = viewport.logical_size(20.0);
-        let hint_measure = measure_text(completed, None, hint_size as u16, 1.0);
-        draw_text(
-            completed,
-            viewport.left + (viewport.logical_size(ARENA_WIDTH) - hint_measure.width) * 0.5,
-            viewport.top + viewport.logical_size(384.0),
-            hint_size,
-            Color::from_rgba(232, 192, 96, 255),
-        );
+        if hud.game_mode != GameMode::Demo {
+            let completed = if result.match_complete() {
+                "MATCH COMPLETE - PRESS R TO PLAY AGAIN"
+            } else {
+                "PRESS R TO START THE NEXT ROUND"
+            };
+            let hint_size = viewport.logical_size(20.0);
+            let hint_measure = measure_text(completed, None, hint_size as u16, 1.0);
+            draw_text(
+                completed,
+                viewport.left + (viewport.logical_size(ARENA_WIDTH) - hint_measure.width) * 0.5,
+                viewport.top + viewport.logical_size(384.0),
+                hint_size,
+                Color::from_rgba(232, 192, 96, 255),
+            );
+        }
+        hud::draw_round_report(snapshot, viewport, hud.game_mode);
     }
     if hud.settings_open {
         draw_settings_overlay(viewport, hud.audio_volume_label);
     }
+    if let Some(feedback) = hud.tactical_feedback {
+        hud::draw_tactical_feedback(feedback, viewport, snapshot.round_result.is_some());
+    }
+    if let Some(number) = hud.round_countdown
+        && !hud.paused
+        && !hud.settings_open
+        && snapshot.round_result.is_none()
+    {
+        draw_round_countdown(number, viewport);
+    }
+}
+
+/// Shows the current round-start number while combat input and simulation remain frozen.
+fn draw_round_countdown(number: u8, viewport: Viewport) {
+    let center = viewport.world_to_screen(WorldVec2::new(640.0, 360.0));
+    let radius = viewport.logical_size(96.0);
+    draw_circle_lines(
+        center.x,
+        center.y,
+        radius,
+        viewport.logical_size(4.0),
+        Color::from_rgba(232, 192, 96, 224),
+    );
+    let label = number.to_string();
+    let font_size = viewport.logical_size(72.0);
+    let measure = measure_text(&label, None, font_size as u16, 1.0);
+    draw_text(
+        &label,
+        center.x - measure.width * 0.5,
+        center.y + measure.height * 0.35,
+        font_size,
+        WHITE,
+    );
 }
 
 /// Shows volume controls above the frozen match without resetting the current round.
@@ -927,6 +1095,77 @@ mod tests {
         macroquad::miniquad::EventHandler::window_minimized_event(&mut events);
         assert!(events.take_lost_focus());
         assert!(!events.take_lost_focus());
+    }
+
+    #[test]
+    fn focus_loss_pauses_active_local_modes_but_not_demo_playback() {
+        assert!(!should_pause_on_focus_loss(GameMode::Demo));
+        assert!(should_pause_on_focus_loss(GameMode::VersusAi));
+        assert!(should_pause_on_focus_loss(GameMode::LocalTwoPlayer));
+    }
+
+    #[test]
+    fn demo_result_restarts_after_three_unfrozen_seconds() {
+        let mut timer = DemoResultTimer::default();
+        for _ in 0..11 {
+            assert!(!timer.update(GameMode::Demo, true, false, 0.25));
+        }
+        assert!(timer.update(GameMode::Demo, true, false, 0.25));
+        assert_eq!(timer.elapsed_seconds, DEMO_RESULT_DURATION_SECONDS);
+    }
+
+    #[test]
+    fn demo_result_timer_freezes_during_pause_and_settings() {
+        let mut timer = DemoResultTimer::default();
+        assert!(!timer.update(GameMode::Demo, true, true, 3.0));
+        assert!(!timer.update(GameMode::Demo, true, false, 0.5));
+        assert_eq!(timer.elapsed_seconds, 0.25);
+    }
+
+    #[test]
+    fn demo_result_timer_resets_when_result_or_demo_mode_ends() {
+        let mut timer = DemoResultTimer {
+            elapsed_seconds: 2.5,
+        };
+        assert!(!timer.update(GameMode::Demo, false, false, 0.1));
+        assert_eq!(timer.elapsed_seconds, 0.0);
+        timer.elapsed_seconds = 2.5;
+        assert!(!timer.update(GameMode::VersusAi, true, false, 0.1));
+        assert_eq!(timer.elapsed_seconds, 0.0);
+    }
+
+    #[test]
+    fn round_start_timer_displays_three_two_one_then_starts_combat() {
+        let mut timer = RoundStartTimer::default();
+        assert_eq!(timer.displayed_number(), Some(3));
+        for _ in 0..3 {
+            timer.advance(0.25, false);
+        }
+        assert_eq!(timer.displayed_number(), Some(3));
+        timer.advance(0.25, false);
+        assert_eq!(timer.displayed_number(), Some(2));
+        for _ in 0..4 {
+            timer.advance(0.25, false);
+        }
+        assert_eq!(timer.displayed_number(), Some(1));
+        for _ in 0..4 {
+            timer.advance(0.25, false);
+        }
+        assert_eq!(timer.displayed_number(), None);
+        assert!(!timer.active);
+    }
+
+    #[test]
+    fn round_start_timer_freezes_and_restarts_after_a_round_reset() {
+        let mut timer = RoundStartTimer::default();
+        timer.advance(0.75, true);
+        assert_eq!(timer.elapsed_seconds, 0.0);
+        timer.advance(0.75, false);
+        assert_eq!(timer.displayed_number(), Some(3));
+
+        timer.begin();
+        assert_eq!(timer.elapsed_seconds, 0.0);
+        assert_eq!(timer.displayed_number(), Some(3));
     }
 
     #[test]

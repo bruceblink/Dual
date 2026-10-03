@@ -717,6 +717,30 @@ impl MatchScore {
     }
 }
 
+/// Immutable per-player counters used by the result screen and replay tooling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlayerCombatStats {
+    pub shortbow_shots: u32,
+    pub shortbow_hits: u32,
+    pub longbow_shots: u32,
+    pub longbow_hits: u32,
+    pub charge_breaks: u32,
+}
+
+/// Round-scoped counters that do not influence deterministic combat outcomes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoundCombatStats {
+    pub active_frames: u32,
+    pub interception_count: u32,
+    pub players: [PlayerCombatStats; 2],
+}
+
+impl RoundCombatStats {
+    fn player_mut(&mut self, side: Side) -> &mut PlayerCombatStats {
+        &mut self.players[side.index()]
+    }
+}
+
 /// Observable simulation event consumed by HUD and replay tooling.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SimEvent {
@@ -819,6 +843,7 @@ pub struct FrameSnapshot {
     pub arrows: Vec<ArrowSnapshot>,
     pub score: MatchScore,
     pub round_result: Option<RoundResult>,
+    pub round_stats: RoundCombatStats,
     pub events: Vec<SimEvent>,
 }
 
@@ -834,6 +859,7 @@ pub struct Simulation {
     previous_shortbow: [bool; 2],
     buffered_shortbow_frames: [u16; 2],
     tactical_events: TacticalEventRecorder,
+    round_stats: RoundCombatStats,
     events: Vec<SimEvent>,
 }
 
@@ -854,6 +880,7 @@ impl Simulation {
             previous_shortbow: [false; 2],
             buffered_shortbow_frames: [0; 2],
             tactical_events: TacticalEventRecorder::default(),
+            round_stats: RoundCombatStats::default(),
             events: Vec::new(),
         }
     }
@@ -884,6 +911,7 @@ impl Simulation {
                 .collect(),
             score: self.score,
             round_result: self.last_round_result,
+            round_stats: self.round_stats,
             events: self.events.clone(),
         }
     }
@@ -915,6 +943,7 @@ impl Simulation {
         if self.last_round_result.is_some() {
             return;
         }
+        self.round_stats.active_frames = self.round_stats.active_frames.saturating_add(1);
         self.events.clear();
         self.update_arrows();
         self.update_players(inputs);
@@ -942,6 +971,7 @@ impl Simulation {
         self.previous_shortbow = [false; 2];
         self.buffered_shortbow_frames = [0; 2];
         self.tactical_events.reset();
+        self.round_stats = RoundCombatStats::default();
         self.events.clear();
     }
 
@@ -1192,6 +1222,8 @@ impl Simulation {
         player_mut.shortbow_ammo -= 1;
         player_mut.shortbow_recovery_frames = 0;
         player_mut.shortbow_cooldown_frames = SHORTBOW_FIRE_INTERVAL_FRAMES;
+        let stats = self.round_stats.player_mut(player.side);
+        stats.shortbow_shots = stats.shortbow_shots.saturating_add(1);
         self.events.push(SimEvent::ShortbowFired {
             attacker: player.side,
         });
@@ -1227,6 +1259,8 @@ impl Simulation {
         player_mut.longbow_charge_frames = 0;
         player_mut.longbow_recovery_frames = LONGBOW_RECOVERY_FRAMES;
         player_mut.phase = PlayerPhase::Move;
+        let stats = self.round_stats.player_mut(player.side);
+        stats.longbow_shots = stats.longbow_shots.saturating_add(1);
         self.events.push(SimEvent::LongbowFired {
             attacker: player.side,
         });
@@ -1276,6 +1310,8 @@ impl Simulation {
         if let Some((first_index, second_index, _, position)) = earliest {
             self.arrows[first_index].removed = true;
             self.arrows[second_index].removed = true;
+            self.round_stats.interception_count =
+                self.round_stats.interception_count.saturating_add(1);
             self.events.push(SimEvent::ArrowIntercepted { position });
             self.events
                 .push(SimEvent::Tactical(TacticalEvent::intercept(
@@ -1309,6 +1345,8 @@ impl Simulation {
                 self.arrows[arrow_index].removed = true;
                 if arrow.kind.is_lethal() {
                     self.players[target.index()].phase = PlayerPhase::Dead;
+                    let stats = self.round_stats.player_mut(attacker);
+                    stats.longbow_hits = stats.longbow_hits.saturating_add(1);
                     self.events.push(SimEvent::LongbowHit { attacker, target });
                     if let Some(event) = self
                         .tactical_events
@@ -1339,6 +1377,11 @@ impl Simulation {
                     target_player.longbow_charge_frames = 0;
                     self.tactical_events
                         .record_longbow_charge_cancelled(target, self.frame.saturating_add(1));
+                }
+                let stats = self.round_stats.player_mut(attacker);
+                stats.shortbow_hits = stats.shortbow_hits.saturating_add(1);
+                if charge_interrupted {
+                    stats.charge_breaks = stats.charge_breaks.saturating_add(1);
                 }
                 self.events.push(SimEvent::ShortbowHit { attacker, target });
                 let pressure_event = self
@@ -1494,6 +1537,10 @@ mod tests {
         assert_eq!(target.phase, PlayerPhase::Damaged);
         assert_eq!(target.damage_remaining_frames, DAMAGED_FRAMES);
         assert!(target.velocity.y < 0.0);
+        let stats = simulation.snapshot().round_stats.players[Side::One.index()];
+        assert_eq!(stats.shortbow_shots, 1);
+        assert_eq!(stats.shortbow_hits, 1);
+        assert!(simulation.snapshot().round_stats.active_frames > 0);
         simulation.step([PlayerInput::empty(), PlayerInput::empty()]);
         assert!(simulation.players()[1].position.y < 580.0);
     }
@@ -1548,6 +1595,61 @@ mod tests {
         );
         assert_eq!(simulation.players()[0].pressure_count, 1);
         assert_eq!(simulation.players()[1].pressure_count, 1);
+    }
+
+    #[test]
+    fn confirmed_shortbow_charge_break_is_counted_for_the_attacker() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 22);
+        let target = &mut simulation.players[Side::Two.index()];
+        target.phase = PlayerPhase::LongbowCharge;
+        target.longbow_charge_frames = 12;
+        simulation.arrows.push(ArrowState::new(
+            Side::One,
+            ArrowKind::Shortbow,
+            target.position,
+            0.0,
+            SHORTBOW_ARROW_START_SPEED,
+        ));
+
+        simulation.resolve_player_hits();
+
+        let stats = simulation.snapshot().round_stats.players[Side::One.index()];
+        assert_eq!(stats.shortbow_hits, 1);
+        assert_eq!(stats.charge_breaks, 1);
+    }
+
+    #[test]
+    fn one_swept_arrow_interception_is_counted_once() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 23);
+        let mut first = ArrowState::new(
+            Side::One,
+            ArrowKind::Shortbow,
+            Vec2::new(20.0, 100.0),
+            0.0,
+            SHORTBOW_ARROW_START_SPEED,
+        );
+        first.previous_position = Vec2::new(0.0, 100.0);
+        let mut second = ArrowState::new(
+            Side::Two,
+            ArrowKind::Shortbow,
+            Vec2::new(0.0, 100.0),
+            0.0,
+            SHORTBOW_ARROW_START_SPEED,
+        );
+        second.previous_position = Vec2::new(20.0, 100.0);
+        simulation.arrows.extend([first, second]);
+
+        simulation.resolve_arrow_interception();
+
+        assert_eq!(simulation.snapshot().round_stats.interception_count, 1);
+        assert_eq!(
+            simulation
+                .events()
+                .iter()
+                .filter(|event| matches!(event, SimEvent::ArrowIntercepted { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1698,9 +1800,32 @@ mod tests {
             .expect("longbow should finish the round");
         assert_eq!(result.winner(), WinnerSide::SideOne);
         assert!(result.match_complete());
+        let stats = simulation.snapshot().round_stats.players[Side::One.index()];
+        assert_eq!(stats.longbow_shots, 1);
+        assert_eq!(stats.longbow_hits, 1);
         let frozen = simulation.snapshot();
         simulation.step([held, held]);
         assert_eq!(simulation.snapshot(), frozen);
+    }
+
+    #[test]
+    fn round_stats_reset_between_rounds_without_changing_match_score() {
+        let mut simulation = Simulation::new(SimulationConfig::default(), 21);
+        simulation.step([
+            PlayerInput {
+                shortbow: true,
+                ..PlayerInput::empty()
+            },
+            PlayerInput::empty(),
+        ]);
+        assert!(simulation.snapshot().round_stats.players[Side::One.index()].shortbow_shots > 0);
+
+        simulation.reset_round();
+
+        let snapshot = simulation.snapshot();
+        assert_eq!(snapshot.round_stats, RoundCombatStats::default());
+        assert_eq!(snapshot.score.player_one_wins, 0);
+        assert_eq!(snapshot.score.player_two_wins, 0);
     }
 
     #[test]
