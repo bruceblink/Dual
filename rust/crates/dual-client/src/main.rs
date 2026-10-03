@@ -8,7 +8,10 @@ use macroquad::prelude::*;
 use settings::AudioSettings;
 
 mod audio_feedback;
+mod effects;
 mod settings;
+
+use effects::VisualEffects;
 
 const LOGICAL_STEP_SECONDS: f32 = 1.0 / FPS as f32;
 const MAX_CATCH_UP_STEPS: usize = 8;
@@ -203,6 +206,7 @@ async fn main() {
     let mut paused = false;
     let mut settings_open = false;
     let mut audio_settings = AudioSettings::default();
+    let mut visual_effects = VisualEffects::default();
     let mut press_edges = PressEdges::default();
     let mut focus_events = WindowFocusEvents::default();
     let focus_subscriber = macroquad::input::utils::register_input_subscriber();
@@ -276,6 +280,7 @@ async fn main() {
             if reset_match {
                 simulation = new_simulation(arena);
                 ai = create_ai_pair(game_mode, difficulty, simulation.seed());
+                visual_effects.clear();
                 paused = false;
                 accumulator = 0.0;
                 press_edges.clear();
@@ -315,6 +320,7 @@ async fn main() {
                 PlayerInput::empty()
             };
             simulation.step([player_one_input, player_two_input]);
+            visual_effects.advance(&simulation.snapshot());
             if simulation.events().contains(&SimEvent::LongbowChargeReady {
                 attacker: Side::One,
             }) || simulation.events().contains(&SimEvent::LongbowChargeReady {
@@ -338,6 +344,7 @@ async fn main() {
             } else {
                 simulation.reset_round();
             }
+            visual_effects.clear();
             accumulator = 0.0;
             press_edges.clear();
         }
@@ -355,6 +362,7 @@ async fn main() {
         draw_snapshot(
             &simulation,
             &simulation.snapshot(),
+            &visual_effects,
             viewport,
             HudState {
                 mode_label,
@@ -495,6 +503,7 @@ fn read_local_opponent_input(shortbow_pressed: bool) -> PlayerInput {
 fn draw_snapshot(
     simulation: &Simulation,
     snapshot: &FrameSnapshot,
+    visual_effects: &VisualEffects,
     viewport: Viewport,
     hud: HudState<'_>,
 ) {
@@ -522,6 +531,7 @@ fn draw_snapshot(
             viewport,
         );
     }
+    visual_effects.draw(viewport.left, viewport.top, viewport.scale);
     draw_hud(snapshot, viewport, hud);
 }
 
